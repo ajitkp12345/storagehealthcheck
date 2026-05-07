@@ -27,21 +27,24 @@ class StorageHealthCheck:
         print("Select storage platform:")
         print("1. Pure Storage")
         print("2. NetApp ONTAP")
-        print("3. Exit")
+        print("3. Cisco UCS Manager")
+        print("4. Exit")
         print("="*50)
 
         while True:
             try:
-                choice = input("Enter your choice (1-3): ").strip()
+                choice = input("Enter your choice (1-4): ").strip()
                 if choice == '1':
                     return 'pure'
                 elif choice == '2':
                     return 'netapp'
                 elif choice == '3':
+                    return 'ucsm'
+                elif choice == '4':
                     print("Exiting...")
                     sys.exit(0)
                 else:
-                    print("Invalid choice. Please enter 1, 2, or 3.")
+                    print("Invalid choice. Please enter 1, 2, 3, or 4.")
             except KeyboardInterrupt:
                 print("\nExiting...")
                 sys.exit(0)
@@ -71,7 +74,7 @@ class StorageHealthCheck:
                 return value
         return default
 
-    def _health_status(self, raw_status):
+    def _health_status(self, raw_status, default_as_critical=True):
         """Normalize a status value and return (status, display_value)."""
         if isinstance(raw_status, dict):
             raw_status = self._resolve_field(raw_status, ['status', 'state', 'health', 'online'])
@@ -86,10 +89,82 @@ class StorageHealthCheck:
             return ('OK', status_text)
         if normalized in ['warning', 'degraded', 'partial', 'partially degraded', 'limited', 'alert']:
             return ('WARNING', status_text)
-        if normalized in ['critical', 'down', 'offline', 'false', 'unavailable', 'failed', 'error', 'unknown']:
+        if normalized == 'unknown' and not default_as_critical:
+            return (None, status_text or 'Unknown')
+        if normalized in ['critical', 'down', 'offline', 'false', 'unavailable', 'failed', 'error']:
             return ('CRITICAL', status_text)
 
-        return ('CRITICAL', status_text or 'Unknown')
+        if default_as_critical:
+            return ('CRITICAL', status_text or 'Unknown')
+        return (None, status_text or 'Unknown')
+
+    def _find_status_recursive(self, item):
+        """Recursively search a structure for a known health status."""
+        if isinstance(item, dict):
+            for key, value in item.items():
+                status, display_value = self._health_status(value, default_as_critical=False)
+                if status is not None:
+                    return status, display_value
+                if isinstance(value, (dict, list)):
+                    nested_status = self._find_status_recursive(value)
+                    if nested_status is not None:
+                        return nested_status
+        elif isinstance(item, list):
+            for value in item:
+                status, display_value = self._health_status(value, default_as_critical=False)
+                if status is not None:
+                    return status, display_value
+                if isinstance(value, (dict, list)):
+                    nested_status = self._find_status_recursive(value)
+                    if nested_status is not None:
+                        return nested_status
+        return None
+
+    def _extract_status(self, item):
+        """Extract a status from a record using known fields and nested values."""
+        if not isinstance(item, dict):
+            return ('CRITICAL', 'Unknown')
+
+        status_value = self._resolve_field(item, ['state', 'health', 'status', 'online', 'is_online', 'service_state', 'volume_state', 'operational_state'])
+        status, display_value = self._health_status(status_value, default_as_critical=False)
+        if status is not None:
+            return status, display_value
+
+        nested = self._find_status_recursive(item)
+        if nested is not None:
+            return nested
+
+        return ('CRITICAL', 'Unknown')
+
+    def _get_json_from_endpoints(self, session, base_url, paths):
+        """Try a list of endpoint paths and return the first JSON result."""
+        for path in paths:
+            try:
+                response = session.get(f"{base_url}{path}", timeout=10)
+                if response.status_code == 200:
+                    return response.json()
+            except requests.exceptions.RequestException:
+                continue
+        return None
+
+    def _summarize_records(self, data, keys):
+        """Summarize record statuses from JSON data using candidate keys."""
+        records = []
+        if isinstance(data, dict):
+            if 'records' in data and isinstance(data['records'], list):
+                records = data['records']
+            else:
+                records = [data]
+        elif isinstance(data, list):
+            records = data
+
+        counts = {'OK': 0, 'WARNING': 0, 'CRITICAL': 0}
+        for record in records:
+            value = self._resolve_field(record, keys, 'Unknown')
+            status, _ = self._health_status(value)
+            counts[status] += 1
+
+        return counts, len(records)
 
     def check_pure_storage(self, ip, username, password, auth_type='password'):
         """Perform health checks on Pure Storage array."""
@@ -188,8 +263,7 @@ class StorageHealthCheck:
             cluster_data = response.json()
 
             # Cluster health
-            cluster_status = cluster_data.get('health', cluster_data.get('status', cluster_data.get('state', 'Unknown')))
-            status, display_value = self._health_status(cluster_status)
+            status, display_value = self._extract_status(cluster_data)
             checks.append({
                 'platform': 'NetApp ONTAP',
                 'component': 'Cluster',
@@ -204,8 +278,7 @@ class StorageHealthCheck:
             if response.status_code == 200:
                 nodes_data = response.json()
                 for node in nodes_data.get('records', []):
-                    node_status = node.get('health', node.get('status', node.get('state', 'Unknown')))
-                    status, display_value = self._health_status(node_status)
+                    status, display_value = self._extract_status(node)
                     checks.append({
                         'platform': 'NetApp ONTAP',
                         'component': 'Node',
@@ -220,8 +293,7 @@ class StorageHealthCheck:
             if response.status_code == 200:
                 agg_data = response.json()
                 for agg in agg_data.get('records', []):
-                    agg_status = self._resolve_field(agg, ['state', 'health', 'status', 'online'])
-                    status, display_value = self._health_status(agg_status)
+                    status, display_value = self._extract_status(agg)
                     checks.append({
                         'platform': 'NetApp ONTAP',
                         'component': 'Aggregate',
@@ -236,8 +308,7 @@ class StorageHealthCheck:
             if response.status_code == 200:
                 vol_data = response.json()
                 for vol in vol_data.get('records', []):
-                    vol_status = self._resolve_field(vol, ['state', 'health', 'status', 'online', 'is_online'])
-                    status, display_value = self._health_status(vol_status)
+                    status, display_value = self._extract_status(vol)
                     checks.append({
                         'platform': 'NetApp ONTAP',
                         'component': 'Volume',
@@ -259,10 +330,160 @@ class StorageHealthCheck:
 
         return checks
 
+    def check_ucs_manager(self, ip, username, password):
+        """Perform health checks on Cisco UCS Manager."""
+        base_url = f"https://{ip}"
+        session = requests.Session()
+        session.auth = (username, password)
+        session.verify = False
+        session.headers.update({'Accept': 'application/json'})
+
+        checks = []
+
+        try:
+            faults = self._get_json_from_endpoints(session, base_url, [
+                '/api/faults', '/faults', '/api/health/faults', '/health/faults',
+                '/faultSummary', '/api/faultSummary'
+            ])
+            if faults is not None:
+                counts, total = self._summarize_records(faults, ['severity', 'faultSeverity', 'level', 'status'])
+                status = 'OK' if counts['CRITICAL'] == 0 and total > 0 else 'WARNING' if counts['WARNING'] > 0 else 'CRITICAL'
+                checks.append({
+                    'platform': 'Cisco UCS Manager',
+                    'component': 'Fault Summary',
+                    'check_name': 'Fault summary by severity',
+                    'value': f"OK={counts['OK']} WARNING={counts['WARNING']} CRITICAL={counts['CRITICAL']} ({total} total)",
+                    'status': status,
+                    'recommended_action': 'Review UCS fault severity and clear or escalate any critical faults'
+                })
+            else:
+                checks.append({
+                    'platform': 'Cisco UCS Manager',
+                    'component': 'Fault Summary',
+                    'check_name': 'Fault summary by severity',
+                    'value': 'No fault summary returned',
+                    'status': 'WARNING',
+                    'recommended_action': 'Verify UCS Manager fault API endpoint or credentials'
+                })
+
+            blades = self._get_json_from_endpoints(session, base_url, [
+                '/api/blades', '/blades', '/inventory/blades', '/servers', '/inventory/servers'
+            ])
+            if blades is not None:
+                counts, total = self._summarize_records(blades, ['operability', 'status', 'health', 'state'])
+                status = 'OK' if counts['CRITICAL'] == 0 else 'WARNING' if counts['WARNING'] > 0 else 'CRITICAL'
+                checks.append({
+                    'platform': 'Cisco UCS Manager',
+                    'component': 'Blade/Server',
+                    'check_name': 'Blade/server operability',
+                    'value': f"OK={counts['OK']} WARNING={counts['WARNING']} CRITICAL={counts['CRITICAL']} ({total} total)",
+                    'status': status,
+                    'recommended_action': 'Investigate any blades or servers that are not operable'
+                })
+            else:
+                checks.append({
+                    'platform': 'Cisco UCS Manager',
+                    'component': 'Blade/Server',
+                    'check_name': 'Blade/server operability',
+                    'value': 'No blade/server data returned',
+                    'status': 'WARNING',
+                    'recommended_action': 'Verify UCS Manager blade/server API endpoint or credentials'
+                })
+
+            psus = self._get_json_from_endpoints(session, base_url, [
+                '/api/psus', '/inventory/power-supplies', '/power-supplies', '/status/psus'
+            ])
+            fans = self._get_json_from_endpoints(session, base_url, [
+                '/api/fans', '/inventory/fans', '/fans', '/status/fans'
+            ])
+            combined_counts = {'OK': 0, 'WARNING': 0, 'CRITICAL': 0}
+            total_equipment = 0
+            if psus is not None:
+                psu_counts, psu_total = self._summarize_records(psus, ['status', 'health', 'state', 'operability'])
+                total_equipment += psu_total
+                for key in combined_counts:
+                    combined_counts[key] += psu_counts[key]
+            if fans is not None:
+                fan_counts, fan_total = self._summarize_records(fans, ['status', 'health', 'state', 'operability'])
+                total_equipment += fan_total
+                for key in combined_counts:
+                    combined_counts[key] += fan_counts[key]
+            if total_equipment > 0:
+                status = 'OK' if combined_counts['CRITICAL'] == 0 else 'WARNING' if combined_counts['WARNING'] > 0 else 'CRITICAL'
+                checks.append({
+                    'platform': 'Cisco UCS Manager',
+                    'component': 'PSU/FAN',
+                    'check_name': 'PSU / FAN status',
+                    'value': f"OK={combined_counts['OK']} WARNING={combined_counts['WARNING']} CRITICAL={combined_counts['CRITICAL']} ({total_equipment} total)",
+                    'status': status,
+                    'recommended_action': 'Check power supplies and fans for any degraded or failed components'
+                })
+            else:
+                checks.append({
+                    'platform': 'Cisco UCS Manager',
+                    'component': 'PSU/FAN',
+                    'check_name': 'PSU / FAN status',
+                    'value': 'No PSU/FAN data returned',
+                    'status': 'WARNING',
+                    'recommended_action': 'Verify UCS Manager PSU/FAN endpoint or credentials'
+                })
+
+            fi_data = self._get_json_from_endpoints(session, base_url, [
+                '/api/fis', '/fabric-interconnects', '/cluster/fis', '/status/fis'
+            ])
+            if fi_data is not None:
+                if isinstance(fi_data, list):
+                    counts, total = self._summarize_records(fi_data, ['status', 'health', 'state', 'operability'])
+                    status = 'OK' if counts['CRITICAL'] == 0 else 'WARNING' if counts['WARNING'] > 0 else 'CRITICAL'
+                    value = f"OK={counts['OK']} WARNING={counts['WARNING']} CRITICAL={counts['CRITICAL']} ({total} total)"
+                else:
+                    status, display_value = self._extract_status(fi_data)
+                    value = display_value
+                checks.append({
+                    'platform': 'Cisco UCS Manager',
+                    'component': 'FI Cluster',
+                    'check_name': 'FI cluster state',
+                    'value': value,
+                    'status': status,
+                    'recommended_action': 'Verify fabric interconnect cluster state and investigate any failures'
+                })
+            else:
+                checks.append({
+                    'platform': 'Cisco UCS Manager',
+                    'component': 'FI Cluster',
+                    'check_name': 'FI cluster state',
+                    'value': 'No FI cluster data returned',
+                    'status': 'WARNING',
+                    'recommended_action': 'Verify UCS Manager FI cluster endpoint or credentials'
+                })
+
+        except requests.exceptions.RequestException as e:
+            checks.append({
+                'platform': 'Cisco UCS Manager',
+                'component': 'Connection',
+                'check_name': 'API Connectivity',
+                'value': f"Failed: {str(e)}",
+                'status': 'CRITICAL',
+                'recommended_action': 'Verify IP, credentials, and network connectivity'
+            })
+
+        return checks
+
     def display_results(self, checks):
-        """Display health check results in a formatted way."""
+        """Display health check results in a summarized component view."""
         print("\n" + "="*80)
         print("HEALTH CHECK RESULTS")
+        print("="*80)
+
+        summary = {}
+        for check in checks:
+            key = (check['platform'], check['component'])
+            if key not in summary:
+                summary[key] = {'OK': 0, 'WARNING': 0, 'CRITICAL': 0}
+            summary[key][check['status']] += 1
+
+        for (platform, component), counts in summary.items():
+            print(f"{platform} / {component}: OK={counts['OK']} WARNING={counts['WARNING']} CRITICAL={counts['CRITICAL']}")
         print("="*80)
 
         for check in checks:
@@ -311,6 +532,8 @@ class StorageHealthCheck:
                 checks = self.check_pure_storage(ip, username, password, auth_type)
             elif platform == 'netapp':
                 checks = self.check_netapp_ontap(ip, username, password)
+            elif platform == 'ucsm':
+                checks = self.check_ucs_manager(ip, username, password)
 
             self.display_results(checks)
             self.save_report(checks, platform)

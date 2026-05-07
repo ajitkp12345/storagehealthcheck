@@ -69,6 +69,10 @@ pyinstaller --onefile --windowed --name storage_health_check storage_health_chec
 
 The executable will be created in the `dist/` directory.
 
+**Note**: For Windows EXE files, build on a Windows system. The `--windowed` flag prevents console window on Windows. On Linux/Mac, it creates a console application.
+
+**Troubleshooting**: If you encounter "Python was built without shared library" error, you may need to use a different Python distribution or build Python with `--enable-shared`.
+
 ## Security Notes
 
 - Credentials are never stored on disk

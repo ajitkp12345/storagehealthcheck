@@ -40,10 +40,11 @@ Each health check produces a normalized record with:
 
 1. Run the executable: `storage_health_check.exe`
 2. Select storage platform from the menu
-3. Enter management IP/hostname
-4. Provide API credentials (username/password)
-5. View results on console
-6. JSON report is automatically saved
+3. For Pure Storage, select authentication method (Username/Password or API Token)
+4. Enter management IP/hostname
+5. Provide API credentials (username/password or API token)
+6. View results on console
+7. JSON report is automatically saved
 
 ## Building the EXE
 
@@ -79,6 +80,7 @@ The executable will be created in the `dist/` directory.
 - All API calls are read-only
 - SSL certificate verification is disabled for customer environments
 - No data is transmitted externally
+- For Pure Storage, supports both username/password and API token authentication
 
 ## Testing
 

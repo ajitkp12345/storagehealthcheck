@@ -48,7 +48,7 @@ class TestStorageHealthCheck(unittest.TestCase):
         mock_session.get.side_effect = [mock_array_response, mock_hw_response]
 
         # Run the check
-        results = self.checker.check_pure_storage('192.168.1.1', 'user', 'pass')
+        results = self.checker.check_pure_storage('192.168.1.1', 'user', 'pass', 'password')
 
         # Verify results: array status, capacity, 2 hardware = 4 total
         self.assertEqual(len(results), 4)
@@ -80,7 +80,7 @@ class TestStorageHealthCheck(unittest.TestCase):
         # Mock failed response using requests exception
         mock_session.get.side_effect = requests.exceptions.RequestException("Connection failed")
 
-        results = self.checker.check_pure_storage('192.168.1.1', 'user', 'pass')
+        results = self.checker.check_pure_storage('192.168.1.1', 'user', 'pass', 'password')
 
         self.assertEqual(len(results), 1)
         failure_check = results[0]

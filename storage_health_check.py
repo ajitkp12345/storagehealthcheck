@@ -63,11 +63,43 @@ class StorageHealthCheck:
 
         return ip, username, password
 
-    def check_pure_storage(self, ip, username, password):
+    def _resolve_field(self, data, keys, default='Unknown'):
+        """Return the first non-empty value from a list of keys."""
+        for key in keys:
+            value = data.get(key) if isinstance(data, dict) else None
+            if value not in (None, ''):
+                return value
+        return default
+
+    def _health_status(self, raw_status):
+        """Normalize a status value and return (status, display_value)."""
+        if isinstance(raw_status, dict):
+            raw_status = self._resolve_field(raw_status, ['status', 'state', 'health', 'online'])
+
+        if isinstance(raw_status, bool):
+            return ('OK' if raw_status else 'CRITICAL', str(raw_status))
+
+        status_text = str(raw_status).strip()
+        normalized = status_text.lower()
+
+        if normalized in ['ok', 'healthy', 'online', 'up', 'active', 'true', 'available', 'ready', 'normal', 'operational']:
+            return ('OK', status_text)
+        if normalized in ['warning', 'degraded', 'partial', 'partially degraded', 'limited', 'alert']:
+            return ('WARNING', status_text)
+        if normalized in ['critical', 'down', 'offline', 'false', 'unavailable', 'failed', 'error', 'unknown']:
+            return ('CRITICAL', status_text)
+
+        return ('CRITICAL', status_text or 'Unknown')
+
+    def check_pure_storage(self, ip, username, password, auth_type='password'):
         """Perform health checks on Pure Storage array."""
         base_url = f"https://{ip}/api/1.19"
         session = requests.Session()
-        session.auth = (username, password)
+        session.headers.update({'Accept': 'application/json'})
+        if auth_type == 'token':
+            session.headers.update({'X-Auth-Token': password})
+        else:
+            session.auth = (username, password)
         session.verify = False
 
         checks = []
@@ -75,16 +107,24 @@ class StorageHealthCheck:
         try:
             # Check array info
             response = session.get(f"{base_url}/array")
+            if auth_type == 'token' and response.status_code == 401:
+                # Try alternate token header if the Pure API uses a bearer-style header
+                session.headers.pop('X-Auth-Token', None)
+                session.headers.update({'Authorization': f'Bearer {password}'})
+                response = session.get(f"{base_url}/array")
+
             response.raise_for_status()
             array_data = response.json()
 
             # Array operational state
+            node_status = array_data.get('status', array_data.get('health', 'Unknown'))
+            status, display_value = self._health_status(node_status)
             checks.append({
                 'platform': 'Pure Storage',
                 'component': 'Array',
                 'check_name': 'Operational State',
-                'value': array_data.get('status', 'Unknown'),
-                'status': 'OK' if array_data.get('status') == 'ready' else 'CRITICAL',
+                'value': display_value,
+                'status': status,
                 'recommended_action': 'Contact Pure Storage support if not ready'
             })
 
@@ -108,12 +148,13 @@ class StorageHealthCheck:
             if response.status_code == 200:
                 hardware_data = response.json()
                 for hw in hardware_data:
-                    status = 'OK' if hw.get('status') == 'healthy' else 'CRITICAL'
+                    hw_status = hw.get('status', hw.get('health', 'Unknown'))
+                    status, display_value = self._health_status(hw_status)
                     checks.append({
                         'platform': 'Pure Storage',
                         'component': 'Hardware',
                         'check_name': f"{hw.get('name', 'Unknown')} Status",
-                        'value': hw.get('status', 'Unknown'),
+                        'value': display_value,
                         'status': status,
                         'recommended_action': 'Replace faulty hardware component'
                     })
@@ -147,13 +188,13 @@ class StorageHealthCheck:
             cluster_data = response.json()
 
             # Cluster health
-            health = cluster_data.get('health', {})
-            status = 'OK' if health.get('status') == 'ok' else 'CRITICAL'
+            cluster_status = cluster_data.get('health', cluster_data.get('status', cluster_data.get('state', 'Unknown')))
+            status, display_value = self._health_status(cluster_status)
             checks.append({
                 'platform': 'NetApp ONTAP',
                 'component': 'Cluster',
                 'check_name': 'Cluster Health',
-                'value': health.get('status', 'Unknown'),
+                'value': display_value,
                 'status': status,
                 'recommended_action': 'Check cluster logs and node status'
             })
@@ -163,13 +204,13 @@ class StorageHealthCheck:
             if response.status_code == 200:
                 nodes_data = response.json()
                 for node in nodes_data.get('records', []):
-                    node_health = node.get('health', 'Unknown')
-                    status = 'OK' if node_health == 'ok' else 'CRITICAL'
+                    node_status = node.get('health', node.get('status', node.get('state', 'Unknown')))
+                    status, display_value = self._health_status(node_status)
                     checks.append({
                         'platform': 'NetApp ONTAP',
                         'component': 'Node',
                         'check_name': f"{node.get('name', 'Unknown')} Health",
-                        'value': node_health,
+                        'value': display_value,
                         'status': status,
                         'recommended_action': 'Investigate node issues'
                     })
@@ -179,13 +220,13 @@ class StorageHealthCheck:
             if response.status_code == 200:
                 agg_data = response.json()
                 for agg in agg_data.get('records', []):
-                    state = agg.get('state', 'Unknown')
-                    status = 'OK' if state == 'online' else 'CRITICAL'
+                    agg_status = self._resolve_field(agg, ['state', 'health', 'status', 'online'])
+                    status, display_value = self._health_status(agg_status)
                     checks.append({
                         'platform': 'NetApp ONTAP',
                         'component': 'Aggregate',
                         'check_name': f"{agg.get('name', 'Unknown')} State",
-                        'value': state,
+                        'value': display_value,
                         'status': status,
                         'recommended_action': 'Bring aggregate online or investigate issues'
                     })
@@ -195,13 +236,13 @@ class StorageHealthCheck:
             if response.status_code == 200:
                 vol_data = response.json()
                 for vol in vol_data.get('records', []):
-                    state = vol.get('state', 'Unknown')
-                    status = 'OK' if state == 'online' else 'CRITICAL'
+                    vol_status = self._resolve_field(vol, ['state', 'health', 'status', 'online', 'is_online'])
+                    status, display_value = self._health_status(vol_status)
                     checks.append({
                         'platform': 'NetApp ONTAP',
                         'component': 'Volume',
                         'check_name': f"{vol.get('name', 'Unknown')} State",
-                        'value': state,
+                        'value': display_value,
                         'status': status,
                         'recommended_action': 'Bring volume online or investigate issues'
                     })
@@ -248,10 +289,26 @@ class StorageHealthCheck:
 
             ip, username, password = self.get_credentials()
 
+            auth_type = 'password'  # default
+            if platform == 'pure':
+                print("Pure Storage Authentication:")
+                print("1. Username/Password")
+                print("2. API Token")
+                while True:
+                    auth_choice = input("Enter choice (1-2): ").strip()
+                    if auth_choice == '1':
+                        auth_type = 'password'
+                        break
+                    elif auth_choice == '2':
+                        auth_type = 'token'
+                        break
+                    else:
+                        print("Invalid choice.")
+
             print(f"\nConnecting to {platform.upper()} at {ip}...")
 
             if platform == 'pure':
-                checks = self.check_pure_storage(ip, username, password)
+                checks = self.check_pure_storage(ip, username, password, auth_type)
             elif platform == 'netapp':
                 checks = self.check_netapp_ontap(ip, username, password)
 

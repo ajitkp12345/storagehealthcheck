@@ -51,10 +51,23 @@ Requirements:
 - Python 3.8+
 - PyInstaller
 
+Install dependencies:
 ```bash
 pip install -r requirements.txt
-pyinstaller --onefile --windowed storage_health_check.py
+pip install pyinstaller
 ```
+
+Build the executable:
+```bash
+python build.py
+```
+
+Or manually:
+```bash
+pyinstaller --onefile --windowed --name storage_health_check storage_health_check.py
+```
+
+The executable will be created in the `dist/` directory.
 
 ## Security Notes
 

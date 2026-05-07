@@ -80,10 +80,19 @@ The executable will be created in the `dist/` directory.
 - SSL certificate verification is disabled for customer environments
 - No data is transmitted externally
 
-## Requirements
+## Testing
 
-- requests
-- urllib3
+Run the unit tests to verify functionality:
+
+```bash
+pip install pytest
+python -m pytest test_storage_health_check.py -v
+```
+
+Tests include:
+- Mocked API responses for both platforms
+- Success and failure scenarios
+- Output formatting validation
 
 ## License
 
